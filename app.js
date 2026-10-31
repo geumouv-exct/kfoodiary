@@ -330,8 +330,11 @@ async function syncAccountStateToDrive(snapshot){
   if(!driveTokenIsValid()) throw new Error("Google Drive permission expired.");
   isCloudSyncing=true;
   try{
-    if(!driveStateFileId) await findDriveStateFile();
-    await uploadDriveStateFile(snapshot);
+    // Read the latest account snapshot before each write so a device that has
+    // been open for a while does not replace entries added from another device.
+    const cloudSnapshot=await readDriveAccountState();
+    const merged=mergeAccountStates(cloudSnapshot,snapshot);
+    await uploadDriveStateFile(merged);
   } finally { isCloudSyncing=false; }
 }
 function mergeAccountStates(cloudValue,localValue){
