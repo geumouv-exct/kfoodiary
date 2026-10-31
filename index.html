@@ -23,8 +23,9 @@
     </nav>
   </main>
   <canvas id="stickerCanvas" hidden></canvas>
-  <script src="https://accounts.google.com/gsi/client" async defer></script>
-  <script src="config.js"></script>
-  <script src="app.js"></script>
+  <script id="googleIdentityScript" src="https://accounts.google.com/gsi/client" async defer></script>
+  <script type="module" src="./config.js"></script>
+  <script type="module" src="./app.js"></script>
+  <script type="module" src="./src/react-bridge.jsx"></script>
 </body>
 </html>

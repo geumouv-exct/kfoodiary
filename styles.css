@@ -69,3 +69,31 @@ button{cursor:pointer;border:0;background:none}
 /* Book name/photo overlap fix */
 .dish-card{min-height:232px}.dish-img{height:84px;margin-top:10px}.dish-img img{max-height:86px}.dish-card h3{margin:13px 0 0;line-height:1.02;font-size:19px}.dish-card .kr{margin:1px 0 4px;line-height:1.02;font-size:15px}.dish-card p{line-height:1.14;margin:5px 0 9px}
 .auth-menu{position:absolute;left:18px;top:58px;width:46px;height:46px;border-radius:18px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.28);color:#fff8e6;font-size:24px;z-index:2}
+#stampsPage .stamp-scroll{padding-bottom:150px}
+#stampsPage .stamp-rules{text-align:center;color:#f2ead4;font-size:12px;line-height:1.3;margin:0 0 12px;padding:9px 12px;border:1px solid rgba(255,249,224,.35);border-radius:16px;background:rgba(255,249,234,.08)}
+#stampsPage .stamp-list{height:auto;overflow:visible;padding-bottom:12px}
+#stampsPage .challenge-docked{position:absolute;left:18px;right:18px;bottom:94px;z-index:19;margin:0;box-shadow:0 8px 24px rgba(0,0,0,.2)}
+@media(max-width:440px){#stampsPage .challenge-docked{left:14px;right:14px}}
+.google-login-status{display:block;color:#687461;font-size:13px;padding:8px}
+.daily-photo-limit{display:block;padding:0 16px 12px;color:#75806d;font-size:12px;text-align:right}
+.day-gallery-wrap{position:absolute;inset:0;z-index:70;display:grid;place-items:center;padding:72px 16px 96px}
+.day-gallery{position:relative;display:flex;flex-direction:column;width:100%;max-height:100%;overflow:hidden;background:linear-gradient(180deg,#fffaf0,#f8f1df);border:1px solid rgba(255,255,255,.75);border-radius:28px;padding:16px;box-shadow:0 20px 50px rgba(0,0,0,.35)}
+.day-gallery-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-bottom:12px;color:var(--green);flex-shrink:0}
+.day-gallery-head b{display:block;font-size:20px}.day-gallery-head small{display:block;margin-top:3px;color:#75806d}
+.day-gallery-close{width:38px;height:38px;flex:none;border-radius:50%;background:#e5ead8;color:#21442d;font-size:25px;line-height:1}
+.day-photo-card{background:#fffdf5;border:1px solid #e1d6bc;border-radius:20px;padding:10px;box-shadow:var(--soft-shadow)}
+.day-photo-card img{display:block;width:100%;max-height:290px;aspect-ratio:4/3;object-fit:contain;background:#f1ead7;border-radius:14px}
+.day-photo-placeholder{display:grid;place-items:center;min-height:120px;border-radius:14px;background:#f1ead7;color:#75806d;font-size:13px}
+.day-photo-details{display:grid;gap:3px;padding:8px 3px 2px}.day-photo-details b{color:var(--green)}.day-photo-details small{color:#75806d;line-height:1.35;overflow-wrap:anywhere}
+.day-photo-stack{position:relative;width:100%;height:min(43vh,390px);min-height:235px;flex:none;overflow:visible;isolation:isolate}
+.day-photo-stack>.stack{position:relative;width:100%;height:100%;isolation:isolate}
+.day-photo-stack .stack-card{touch-action:pan-y}
+.day-photo-stack .stack-card-face{border-radius:20px!important}
+.day-photo-stack .stack-card-content{border-radius:20px!important}
+.day-photo-stack .stack-card-content>.day-photo-card{height:100%;overflow:hidden}
+.day-photo-stack .stack-card-content .day-photo-card img{max-height:none;height:calc(100% - 68px);object-fit:contain;background:#f1ead7}
+.day-gallery-actions{display:flex;align-items:center;justify-content:space-between;gap:10px;padding-top:12px;flex:none}
+.day-photo-position{color:#75806d;font-size:12px}
+.day-photo-hint{color:#75806d;font-size:11px;text-align:right}
+@media(max-height:650px){.day-gallery-wrap{padding-top:54px;padding-bottom:78px}.day-photo-stack{height:min(38vh,240px);min-height:180px}.day-photo-card img{max-height:170px}.day-photo-placeholder{min-height:100px}}
+@media(prefers-reduced-motion:reduce){.stack-photo{transition:none!important}}

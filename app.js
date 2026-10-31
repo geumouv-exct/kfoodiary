@@ -99,9 +99,29 @@ let viewMonth = new Date().getMonth();
 let viewYear = new Date().getFullYear();
 let uploadData = null;
 let googlePlacesLoaded = false;
+let googleInitializedClientId = "";
+let googleScriptFailed = false;
+let isSavingRecord = false;
+let isPreparingPhoto = false;
+let photoSelectionId = 0;
+
+function isLocalPreviewHost(){
+  return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(window.location.hostname);
+}
 
 function loadAuthUser(){
-  try { return JSON.parse(localStorage.getItem(AUTH_KEY)) || null; }
+  try {
+    const user = JSON.parse(localStorage.getItem(AUTH_KEY)) || null;
+    if(user?.loginProvider === "local-preview" && (!isLocalPreviewHost() || googleClientId())){
+      localStorage.removeItem(AUTH_KEY);
+      return null;
+    }
+    if(user?.loginProvider === "google" && (!Number.isFinite(Number(user.expiresAt)) || Number(user.expiresAt) <= Date.now())){
+      localStorage.removeItem(AUTH_KEY);
+      return null;
+    }
+    return user;
+  }
   catch { return null; }
 }
 function saveAuthUser(){
@@ -137,38 +157,57 @@ function showPage(pageId){
 }
 $$('.tab').forEach(btn=>btn.addEventListener('click',()=>showPage(btn.dataset.page)));
 
-function ymd(date){ return new Date(date).toISOString().slice(0,10); }
+function ymd(date){
+  const value = date instanceof Date ? date : new Date(date);
+  if(!Number.isFinite(value.getTime())) return "";
+  return `${value.getFullYear()}-${String(value.getMonth()+1).padStart(2,"0")}-${String(value.getDate()).padStart(2,"0")}`;
+}
 function monthName(y,m){ return new Date(y,m,1).toLocaleString('en',{month:'long', year:'numeric'}); }
-function recordsThisMonth(){ return state.records.filter(r=>{ const d=new Date(r.date); return d.getFullYear()===viewYear && d.getMonth()===viewMonth; }); }
+function recordsThisMonth(){ return uniquePhotoRecords().filter(r=>{ const d=new Date(r.date); return d.getFullYear()===viewYear && d.getMonth()===viewMonth; }); }
 function unique(arr){ return [...new Set(arr.filter(Boolean))]; }
 function matchDish(record){
   const q = `${record.dishName||""} ${record.dishKr||""}`.toLowerCase();
   return dishDB.find(d => q.includes(d.name.toLowerCase()) || (d.kr && q.includes(d.kr))) || null;
 }
-function unlockedDishIds(){ return new Set(state.records.map(matchDish).filter(Boolean).map(d=>d.id)); }
+function unlockedDishIds(){ return new Set(uniquePhotoRecords().map(matchDish).filter(Boolean).map(d=>d.id)); }
+function uniquePhotoRecords(records = state.records){
+  const accepted = [];
+  const seenHashes = [];
+  records.forEach(record=>{
+    const hash = record.photoHash;
+    if(hash && seenHashes.includes(hash)) return;
+    accepted.push(record);
+    if(hash) seenHashes.push(hash);
+  });
+  return accepted;
+}
+function areSamePhoto(a, b){ return !!a && !!b && a === b; }
+function photoHashPrefix(){ return window.crypto?.subtle ? "sha256:" : "local:"; }
+function isCurrentPhotoHash(hash){ return typeof hash === "string" && hash.startsWith(photoHashPrefix()); }
 function favoriteDishIds(){
   const ids = new Set();
-  state.records.filter(r=>r.favorite).forEach(r=>{ const d=matchDish(r); if(d) ids.add(d.id); });
+  uniquePhotoRecords().filter(r=>r.favorite).forEach(r=>{ const d=matchDish(r); if(d) ids.add(d.id); });
   return ids;
 }
 function stats(){
-  const cats = unique(state.records.map(r=>r.category));
-  const cities = unique(state.records.map(r=>(r.city||"").toLowerCase()));
-  const rests = unique(state.records.map(r=>r.restaurant));
+  const countedRecords = uniquePhotoRecords();
+  const cats = unique(countedRecords.map(r=>r.category));
+  const cities = unique(countedRecords.map(r=>(r.city||"").toLowerCase()));
+  const rests = unique(countedRecords.map(r=>r.restaurant));
   const unlocked = unlockedDishIds();
   const favoriteIds = favoriteDishIds();
   const helper = {
-    total: state.records.length,
-    favorites: state.records.filter(r=>r.favorite).length,
+    total: countedRecords.length,
+    favorites: countedRecords.filter(r=>r.favorite).length,
     restaurants: rests.length,
     cities: cities.length,
     categories: cats.length,
     unlocked: unlocked.size,
-    names: new Set(state.records.map(r=>(r.dishName||"").toLowerCase())),
-    kr: new Set(state.records.map(r=>(r.dishKr||"").toLowerCase())),
-    spicy: state.records.filter(r=>/spicy|street food|떡볶이|매운|hot|chili/i.test(`${r.notes} ${r.category} ${r.dishName} ${r.dishKr}`)).length,
-    category: c => state.records.filter(r=>r.category===c).length,
-    city: c => state.records.filter(r=>(r.city||"").toLowerCase()===c).length,
+    names: new Set(countedRecords.map(r=>(r.dishName||"").toLowerCase())),
+    kr: new Set(countedRecords.map(r=>(r.dishKr||"").toLowerCase())),
+    spicy: countedRecords.filter(r=>/spicy|street food|떡볶이|매운|hot|chili/i.test(`${r.notes} ${r.category} ${r.dishName} ${r.dishKr}`)).length,
+    category: c => countedRecords.filter(r=>r.category===c).length,
+    city: c => countedRecords.filter(r=>(r.city||"").toLowerCase()===c).length,
     unlockedStamps: 0
   };
   helper.unlockedStamps = stampDB.filter(st=>st.test(helper)).length;
@@ -191,6 +230,7 @@ function commonHeader(title, sub = "", right="🔔"){
 
 function renderCalendar(){
   const page = $("#calendarPage");
+  const calendarRecords = uniquePhotoRecords();
   const monthRecords = recordsThisMonth();
   const first = new Date(viewYear, viewMonth, 1);
   const start = new Date(viewYear, viewMonth, 1 - first.getDay());
@@ -198,7 +238,7 @@ function renderCalendar(){
   let cells = "";
   for(let i=0;i<42;i++){
     const d = new Date(start); d.setDate(start.getDate()+i);
-    const dayRecords = state.records.filter(r=>ymd(r.date)===ymd(d));
+    const dayRecords = calendarRecords.filter(r=>ymd(r.date)===ymd(d));
     const sticker = dayRecords[0]?.sticker || "";
     cells += `<button class="day ${d.getMonth()!==viewMonth?'muted':''} ${ymd(d)===today?'today':''}" data-date="${ymd(d)}">
       <span class="date-num">${d.getDate()}</span>${sticker?`<img class="cal-sticker" src="${sticker}" alt="food sticker">`:""}
@@ -208,12 +248,57 @@ function renderCalendar(){
     ${commonHeader("K-Foodendar","Collect your delicious moments")}
     <div class="month-nav"><button id="prevMonth" class="round">‹</button><h2 class="big-title">${monthName(viewYear,viewMonth).replace(' ','<br class="mob">')}</h2><button id="nextMonth" class="round">›</button></div>
     <div class="calendar card"><div class="week"><b>Sun</b><b>Mon</b><b>Tue</b><b>Wed</b><b>Thu</b><b>Fri</b><b>Sat</b></div><div class="grid">${cells}</div></div>
-    ${state.records.length===0?`<div class="empty-state"><strong>No K-food yet</strong>Tap Add and start filling your calendar from zero.</div>`:""}
+    ${calendarRecords.length===0?`<div class="empty-state"><strong>No K-food yet</strong>Tap Add and start filling your calendar from zero.</div>`:""}
     <div class="stats"><div class="stat"><span>🍽️</span><b>${monthRecords.length}</b><span>meals<br>this month</span></div><div class="stat"><span>📍</span><b>${unique(monthRecords.map(r=>r.restaurant)).length}</b><span>restaurants<br>this month</span></div></div>
   </div>`;
   $("#prevMonth").onclick=()=>{ viewMonth--; if(viewMonth<0){viewMonth=11;viewYear--;} renderCalendar(); };
   $("#nextMonth").onclick=()=>{ viewMonth++; if(viewMonth>11){viewMonth=0;viewYear++;} renderCalendar(); };
-  $$(".day",page).forEach(b=>b.onclick=()=>{ const recs=state.records.filter(r=>ymd(r.date)===b.dataset.date); if(recs[0]) toast(`${recs[0].dishName} saved on ${b.dataset.date}`); else { showPage("addPage"); setTimeout(()=>{$("#dateInput").value = `${b.dataset.date}T12:00`;},0); } });
+  $$(".day",page).forEach(b=>b.onclick=()=>{
+    const recs = calendarRecords.filter(r=>ymd(r.date)===b.dataset.date);
+    if(recs.length){ openDayGallery(b.dataset.date); return; }
+    showPage("addPage");
+    setTimeout(()=>{ const input=$("#dateInput"); if(input) input.value = `${b.dataset.date}T12:00`; },0);
+  });
+}
+
+function openDayGallery(dayKey){
+  const records = uniquePhotoRecords().filter(record=>ymd(record.date)===dayKey);
+  if(!records.length) return;
+  $("#dayGallery")?.remove();
+  const date = new Date(`${dayKey}T12:00:00`);
+  const dateLabel = date.toLocaleDateString(undefined,{year:"numeric",month:"long",day:"numeric"});
+  const gallery = document.createElement("div");
+  const returnFocus = document.activeElement;
+  gallery.id = "dayGallery";
+  gallery.className = "day-gallery-wrap";
+  gallery.innerHTML = `<div class="shade" data-action="close-day-gallery"></div>
+    <section class="day-gallery" role="dialog" aria-modal="true" aria-labelledby="dayGalleryTitle">
+      <header class="day-gallery-head"><div><b id="dayGalleryTitle"></b><small>${records.length} / 3 photos</small></div><button class="day-gallery-close" data-action="close-day-gallery" aria-label="Close photo gallery">×</button></header>
+      <div class="day-photo-stack" role="group" aria-label="Photo stack"></div>
+      <div class="day-gallery-actions"><small class="day-photo-position" aria-live="polite"></small><small class="day-photo-hint">Swipe, drag, or tap a photo</small></div>
+    </section>`;
+  $("#dayGalleryTitle",gallery).textContent = dateLabel;
+  const stack = $(".day-photo-stack",gallery);
+  if(records.length < 2){
+    stack.classList.add("single-photo");
+    $(".day-photo-hint",gallery).hidden = true;
+  }
+  const positionLabel = $(".day-photo-position",gallery);
+  positionLabel.textContent = `1 of ${records.length} photos`;
+  const close = ()=>{
+    gallery._unmountPhotoStack?.();
+    gallery.remove();
+    document.removeEventListener("keydown",handleKeydown);
+    returnFocus?.focus?.();
+  };
+  const handleKeydown = event=>{ if(event.key==="Escape") close(); };
+  gallery.querySelectorAll("[data-action='close-day-gallery']").forEach(button=>button.addEventListener("click",close));
+  document.addEventListener("keydown",handleKeydown);
+  $(".phone").appendChild(gallery);
+  gallery._unmountPhotoStack = window.mountDayPhotoStack?.(stack,records,index=>{
+    positionLabel.textContent = `${index+1} of ${records.length} photos`;
+  });
+  $(".day-gallery-close",gallery).focus();
 }
 
 function renderAdd(){
@@ -232,6 +317,7 @@ function renderAdd(){
     </div>
     <div class="card form-card">
       <div class="row"><span class="ico">📅</span><label>Date</label><input id="dateInput" type="datetime-local" value="${now.toISOString().slice(0,16)}"><span>›</span></div>
+      <small class="daily-photo-limit">Save up to 3 photos per date.</small>
       <div class="row"><span class="ico">📍</span><label>Restaurant</label><input id="restaurantInput" placeholder="Search with Google Maps"><span>›</span></div>
       <div class="map-actions"><button id="mapsBtn" class="mini-btn">Open Google Maps</button><small class="map-help">Paste a Google Maps place URL here to auto-fill the name.</small></div>
       <div class="row"><span class="ico">🏙️</span><label>City</label><input id="cityInput" placeholder="Seoul"></div>
@@ -333,15 +419,83 @@ function setupAutocomplete(){
   });
 }
 async function handlePhoto(e){
-  const file = e.target.files?.[0];
+  const input = e.currentTarget;
+  const file = input.files?.[0];
   if(!file) return;
-  const original = await fileToDataURL(file);
-  const sticker = await makeSticker(original);
-  uploadData = { original, sticker };
-  paintPreview(original, sticker);
+  input.value = "";
+  const selectionId = ++photoSelectionId;
+  isPreparingPhoto = true;
+  uploadData = null;
+  $("#photoBox").innerHTML = `<span class="muted">Preparing photo…</span>`;
+  $("#stickerBox").innerHTML = `<span class="muted">Preparing sticker…</span>`;
+  try{
+    const original = await fileToDataURL(file);
+    const [sticker, photoHash] = await Promise.all([makeSticker(original), makePhotoHash(original)]);
+    if(selectionId !== photoSelectionId) return;
+    isPreparingPhoto = false;
+    uploadData = { original, sticker, photoHash };
+    paintPreview(original, sticker);
+  } catch(error){
+    if(selectionId !== photoSelectionId) return;
+    isPreparingPhoto = false;
+    console.error("Could not prepare this food photo.", error);
+    $("#photoBox").innerHTML = `<span class="muted">Choose photo</span>`;
+    $("#stickerBox").innerHTML = `<span class="muted">Sticker preview</span>`;
+    toast("Could not process this photo. Try a different or smaller image.");
+  }
 }
-function fileToDataURL(file){ return new Promise(res=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.readAsDataURL(file); }); }
+function fileToDataURL(file){
+  return new Promise((resolve,reject)=>{
+    const reader = new FileReader();
+    reader.onload = ()=>resolve(reader.result);
+    reader.onerror = ()=>reject(reader.error || new Error("Could not read this photo."));
+    reader.onabort = ()=>reject(new Error("Photo reading was canceled."));
+    reader.readAsDataURL(file);
+  });
+}
 function loadImg(src){ return new Promise((res,rej)=>{ const img=new Image(); img.onload=()=>res(img); img.onerror=rej; img.src=src; }); }
+// Hash the uploaded file bytes so an exact re-upload is rejected without matching different photos of the same dish.
+async function makePhotoHash(src){
+  const payload = String(src).split(",",2)[1] || String(src);
+  if(window.crypto?.subtle){
+    const digest = await window.crypto.subtle.digest("SHA-256",new TextEncoder().encode(payload));
+    const hex = [...new Uint8Array(digest)].map(byte=>byte.toString(16).padStart(2,"0")).join("");
+    return `sha256:${hex}`;
+  }
+  let a=0x811c9dc5, b=0x9e3779b9, c=0x85ebca6b, d=0xc2b2ae35;
+  for(let i=0; i<payload.length; i++){
+    const code = payload.charCodeAt(i);
+    a = Math.imul(a ^ code,0x01000193);
+    b = Math.imul(b ^ (code+i),0x5bd1e995); b ^= b >>> 13;
+    c = Math.imul(c ^ (code+(i<<8)),0x27d4eb2d); c ^= c >>> 15;
+    d = Math.imul(d ^ (code^i),0x165667b1); d ^= d >>> 16;
+  }
+  return `local:${[a,b,c,d].map(value=>(value>>>0).toString(16).padStart(8,"0")).join("")}`;
+}
+async function indexSavedPhotos(records = state.records){
+  const sourceState = state;
+  const email = authUser?.email;
+  let changed = false;
+  for(const record of records){
+    if(isCurrentPhotoHash(record.photoHash) || !record.original) continue;
+    try{
+      record.photoHash = await makePhotoHash(record.original);
+      changed = true;
+    } catch(error){
+      console.warn("Could not index a saved food photo.", error);
+    }
+  }
+  if(changed && state === sourceState && authUser?.email === email){
+    saveState();
+    if(!$("#addPage")?.classList.contains("active")) render();
+  }
+}
+async function getRecordPhotoHash(record){
+  if(isCurrentPhotoHash(record.photoHash)) return record.photoHash;
+  if(!record.original) return "";
+  record.photoHash = await makePhotoHash(record.original);
+  return record.photoHash;
+}
 async function makeSticker(src){
   const img = await loadImg(src);
   const canvas = $("#stickerCanvas"); const size = 520; canvas.width=size; canvas.height=size;
@@ -365,32 +519,78 @@ function roundRect(ctx,x,y,w,h,r){
   const rr=Math.min(r,w/2,h/2); ctx.moveTo(x+rr,y); ctx.arcTo(x+w,y,x+w,y+h,rr); ctx.arcTo(x+w,y+h,x,y+h,rr); ctx.arcTo(x,y+h,x,y,rr); ctx.arcTo(x,y,x+w,y,rr);
 }
 function paintPreview(original, sticker){
-  $("#photoBox").innerHTML = `<img src="${original}" alt="original food photo">`;
-  $("#stickerBox").innerHTML = `<img src="${sticker}" alt="auto cut food sticker">`;
+  const photoBox = $("#photoBox");
+  const stickerBox = $("#stickerBox");
+  if(!photoBox || !stickerBox) return;
+  photoBox.innerHTML = `<img src="${original}" alt="original food photo">`;
+  stickerBox.innerHTML = `<img src="${sticker}" alt="auto cut food sticker">`;
 }
-function saveAddForm(){
+async function saveAddForm(){
   if(!isLoggedIn()){ openAccountPanel(); toast("Please sign in with Google first."); return; }
+  if(isSavingRecord) return;
   const dishRaw = $("#dishInput")?.value.trim();
   if(!dishRaw){ toast("Please enter a dish name."); return; }
+  if(isPreparingPhoto){ toast("Photo is still processing. Please wait a moment."); return; }
   if(!uploadData?.sticker){ toast("Please add a photo first."); return; }
-  const [name, kr=""] = dishRaw.split("/").map(s=>s.trim());
-  const rec = {
-    id: crypto.randomUUID ? crypto.randomUUID() : `rec-${Date.now()}`,
-    date: new Date($("#dateInput").value || Date.now()).toISOString(),
+  const dateValue = $("#dateInput")?.value || "";
+  const recordDate = dateValue ? new Date(dateValue) : new Date();
+  if(!Number.isFinite(recordDate.getTime())){ toast("Please choose a valid date."); return; }
+  const recordDay = ymd(recordDate);
+  const recordsForDay = uniquePhotoRecords().filter(record=>ymd(record.date)===recordDay).length;
+  if(recordsForDay >= 3){ toast("You can save up to 3 photos per date."); return; }
+  const form = {
     restaurant: $("#restaurantInput").value.trim() || "Unknown restaurant",
     city: $("#cityInput").value.trim() || "Unknown city",
-    dishName: name,
-    dishKr: kr,
     category: $("#categoryInput").value,
     notes: $("#notesInput").value.trim(),
-    favorite: $("#favoriteInput").classList.contains("on"),
-    original: uploadData.original,
-    sticker: uploadData.sticker,
-    createdAt: new Date().toISOString()
+    favorite: $("#favoriteInput").classList.contains("on")
   };
-  state.records.push(rec); saveState(); uploadData=null;
-  const d = new Date(rec.date); viewYear=d.getFullYear(); viewMonth=d.getMonth();
-  toast("Saved to Calendar."); showPage("calendarPage");
+  const photo = uploadData;
+  const saveButtons = [$("#quickSave"), $("#saveBtn")].filter(Boolean);
+  isSavingRecord = true;
+  saveButtons.forEach(button=>button.disabled=true);
+  try{
+    const photoHash = photo.photoHash || await makePhotoHash(photo.original);
+    let photoAlreadyUsed = false;
+    for(const record of state.records){
+      const priorHash = await getRecordPhotoHash(record);
+      if(areSamePhoto(photoHash, priorHash)) photoAlreadyUsed = true;
+    }
+    saveState();
+    if(photoAlreadyUsed){
+      toast("This photo was already added. Choose a different photo.");
+      return;
+    }
+    const [name, kr=""] = dishRaw.split("/").map(s=>s.trim());
+    const rec = {
+      id: crypto.randomUUID ? crypto.randomUUID() : `rec-${Date.now()}`,
+      date: recordDate.toISOString(),
+      restaurant: form.restaurant,
+      city: form.city,
+      dishName: name,
+      dishKr: kr,
+      category: form.category,
+      notes: form.notes,
+      favorite: form.favorite,
+      original: photo.original,
+      sticker: photo.sticker,
+      photoHash,
+      createdAt: new Date().toISOString()
+    };
+    state.records.push(rec);
+    saveState();
+    if(uploadData === photo) uploadData = null;
+    const d = new Date(rec.date); viewYear=d.getFullYear(); viewMonth=d.getMonth();
+    renderAdd();
+    showPage("calendarPage");
+    toast("Completed!");
+  } catch(error){
+    console.error("Could not save the food record.", error);
+    toast("Could not save this entry. Please try again.");
+  } finally {
+    isSavingRecord = false;
+    saveButtons.forEach(button=>{ if(button.isConnected) button.disabled=false; });
+  }
 }
 
 function renderBook(){
@@ -419,18 +619,17 @@ function renderBook(){
   }
 }
 function dishCard(d, isUnlocked, isFav){
-  const rec = state.records.find(r=>matchDish(r)?.id===d.id);
+  const rec = uniquePhotoRecords().find(r=>matchDish(r)?.id===d.id);
   const img = rec?.sticker;
   return `<article class="dish-card ${isUnlocked?'':'locked'}">
     <button class="fav-btn ${isFav?'on':''}" data-id="${d.id}" ${isUnlocked?'':'disabled'} title="Favorite">${isFav?'♥':'♡'}</button>
     <div class="dish-img">${img?`<img src="${img}" alt="${d.name}">`:`<span class="emoji">${d.emoji}</span>`}</div>
     <h3>${d.name}</h3><div class="kr">${d.kr}</div><p>${isUnlocked?d.desc:'???'}</p>
-    <div class="badges"><span class="badge">${d.category}</span><span class="badge">${d.city}</span></div>
-    ${isUnlocked?'':`<div class="locked-overlay"><span>🔒 Locked</span></div>`}
+    ${isUnlocked?`<div class="badges"><span class="badge">${d.category}</span><span class="badge">${d.city}</span></div>`:`<div class="locked-overlay"><span>🔒 Locked</span></div>`}
   </article>`;
 }
 function toggleBookFavorite(dishId){
-  const records = state.records.filter(r=>matchDish(r)?.id===dishId);
+  const records = uniquePhotoRecords().filter(r=>matchDish(r)?.id===dishId);
   if(!records.length) return;
   const shouldFav = !records.some(r=>r.favorite);
   records.forEach(r=>r.favorite = shouldFav);
@@ -440,12 +639,13 @@ function toggleBookFavorite(dishId){
 function renderStamps(){
   const page = $("#stampsPage"); const s = stats();
   const unlockedMap = new Map(); stampDB.forEach(st=>unlockedMap.set(st.id, st.test(s)));
-  page.innerHTML = `<div class="scroll">
+  page.innerHTML = `<div class="scroll stamp-scroll">
     ${commonHeader("My Stamps","Collect your delicious moments")}
     <div class="stamp-summary"><div><b>${[...unlockedMap.values()].filter(Boolean).length}</b><br>stamps</div><div><b>${s.restaurants}</b><br>shops</div><div><b>${s.cities}</b><br>cities</div></div>
+    <p class="stamp-rules">Duplicate photos cannot be added. A different photo of the same food counts.</p>
     <div class="stamp-list">${stampDB.map(st=>stampCard(st,unlockedMap.get(st.id))).join("")}</div>
-    <div class="challenge"><b>Next challenge</b><br>${nextChallenge(s)}</div>
-  </div>`;
+  </div>
+  <div class="challenge challenge-docked"><b>Next challenge</b><br>${nextChallenge(s)}</div>`;
 }
 function stampCard(st, ok){
   return `<article class="stamp ${ok?'unlocked':'locked'}"><div class="pic">${st.emoji}</div><small>Level ${st.level}</small><h3>${st.title}</h3><small>${ok?'Unlocked':st.requirement}</small></article>`;
@@ -464,7 +664,6 @@ function attachAuthButtons(){
   $$("[data-action='logout']").forEach(btn=>btn.onclick=logout);
   $$("[data-action='close-account']").forEach(btn=>btn.onclick=closeAccountPanel);
   $$("[data-action='account']").forEach(btn=>btn.onclick=openAccountPanel);
-  $$("[data-action='account']").forEach(btn=>btn.onclick=openAccountPanel);
   $$("[data-action='open-icon-picker']").forEach(btn=>btn.onclick=openIconPicker);
   $$("[data-icon-type]").forEach(btn=>btn.onclick=()=>selectProfileIcon(btn.dataset.iconType, btn.dataset.iconValue));
 }
@@ -482,67 +681,97 @@ function renderAuthGate(){
     gate.className = "auth-gate";
     $(".phone").appendChild(gate);
   }
+  const clientId = googleClientId();
+  const localPreviewAllowed = !clientId && isLocalPreviewHost();
+  const message = clientId
+    ? (googleScriptFailed ? "Google sign-in could not load. Check your connection and reload." : "Continue with your Google account.")
+    : (localPreviewAllowed ? "Google sign-in needs a Client ID. Local preview is available on this device." : "Set GOOGLE_CLIENT_ID in config.js and add this site's origin in Google Cloud Console.");
   gate.innerHTML = `<button class="auth-menu" data-action="account" aria-label="Open account menu">☰</button><div class="auth-card">
     <div class="auth-mascot">🍙</div>
     <h2>Sign in to start your K-Foodendar</h2>
     <p>Google login is required before using Calendar, Add, Book, and Stamps.</p>
     <div id="gateGoogleButton" class="google-button-slot"></div>
-    <button class="google-fallback" data-action="login">Continue with Google</button>
-    <small>${googleClientId() ? "" : "Set GOOGLE_CLIENT_ID in config.js for real Google login. Local preview login is available for Mac testing."}</small>
+    ${localPreviewAllowed ? `<button class="google-fallback" data-action="login">Continue with local preview</button>` : ""}
+    <small>${message}</small>
   </div>`;
   attachAuthButtons();
   renderGoogleButton("gateGoogleButton");
 }
-function googleClientId(){ return window.KFOOD_CONFIG?.GOOGLE_CLIENT_ID?.trim(); }
+function googleClientId(){ return window.KFOOD_CONFIG?.GOOGLE_CLIENT_ID?.trim() || ""; }
 function startGoogleLogin(){
-  if(googleClientId() && window.google?.accounts?.id){
-    google.accounts.id.prompt();
-    renderGoogleButton("panelGoogleButton");
-  } else {
-    authUser = {
-      name: "K-Food Guest",
-      email: "local-preview@kfood.local",
-      picture: "",
-      loginProvider: "local-preview"
-    };
-    saveAuthUser();
-    state = loadState();
-    closeAccountPanel();
-    toast("Local preview login enabled.");
-    render();
+  if(googleClientId() || !isLocalPreviewHost()){
+    toast(googleClientId() ? "Use the Google sign-in button to continue." : "Google sign-in is not configured for this site yet.");
+    return;
   }
+  authUser = {
+    name: "K-Food Guest",
+    email: "local-preview@kfood.local",
+    picture: "",
+    loginProvider: "local-preview"
+  };
+  saveAuthUser();
+  state = loadState();
+  closeAccountPanel();
+  toast("Local preview login enabled.");
+  render();
+  indexSavedPhotos(state.records);
 }
 function initGoogleLogin(){
   const clientId = googleClientId();
-  if(!clientId || !window.google?.accounts?.id) return;
-  google.accounts.id.initialize({
-    client_id: clientId,
-    callback: handleGoogleCredential,
-    auto_select: false,
-    cancel_on_tap_outside: true
-  });
+  const googleId = window.google?.accounts?.id;
+  if(!clientId || !googleId) return false;
+  if(googleInitializedClientId === clientId) return true;
+  try{
+    googleId.initialize({
+      client_id: clientId,
+      callback: handleGoogleCredential,
+      auto_select: false,
+      cancel_on_tap_outside: true
+    });
+    googleInitializedClientId = clientId;
+    return true;
+  } catch(error){
+    console.error("Could not initialize Google sign-in.", error);
+    return false;
+  }
 }
 function renderGoogleButton(containerId){
   const el = $("#"+containerId);
   if(!el) return;
   const clientId = googleClientId();
-  if(!clientId || !window.google?.accounts?.id){ el.innerHTML=""; return; }
-  initGoogleLogin();
+  if(!clientId){ el.innerHTML=""; return; }
+  if(googleScriptFailed){ el.innerHTML = `<span class="google-login-status">Google sign-in could not load.</span>`; return; }
+  if(!initGoogleLogin()){
+    el.innerHTML = `<span class="google-login-status">Loading Google sign-in…</span>`;
+    return;
+  }
   el.innerHTML = "";
-  google.accounts.id.renderButton(el, { theme:"outline", size:"large", shape:"pill", width:260, text:"signin_with" });
+  try{
+    window.google.accounts.id.renderButton(el, { theme:"outline", size:"large", shape:"pill", width:260, text:"signin_with" });
+  } catch(error){
+    console.error("Could not render the Google sign-in button.", error);
+    el.innerHTML = `<span class="google-login-status">Google sign-in is unavailable.</span>`;
+  }
 }
 function decodeJwt(token){
   try{
-    const body = token.split(".")[1].replace(/-/g,"+").replace(/_/g,"/");
+    let body = token.split(".")[1].replace(/-/g,"+").replace(/_/g,"/");
+    body += "=".repeat((4 - body.length % 4) % 4);
     return JSON.parse(decodeURIComponent(atob(body).split("").map(c=>"%"+("00"+c.charCodeAt(0).toString(16)).slice(-2)).join("")));
   } catch { return {}; }
 }
 function handleGoogleCredential(response){
-  const profile = decodeJwt(response.credential);
+  const profile = decodeJwt(response?.credential || "");
+  const expiresAt = Number(profile.exp) * 1000;
+  if(!profile.email || profile.email_verified === false || profile.aud !== googleClientId() || !Number.isFinite(expiresAt) || expiresAt <= Date.now()){
+    toast("Google sign-in could not be confirmed. Please try again.");
+    return;
+  }
   authUser = {
     name: profile.name || profile.given_name || "K-Food User",
-    email: profile.email || `google-${Date.now()}@kfood.local`,
+    email: profile.email,
     picture: profile.picture || "",
+    expiresAt,
     loginProvider: "google"
   };
   saveAuthUser();
@@ -550,12 +779,16 @@ function handleGoogleCredential(response){
   closeAccountPanel();
   toast(`Welcome, ${authUser.name}!`);
   render();
+  indexSavedPhotos(state.records);
 }
 function logout(){
+  window.google?.accounts?.id?.disableAutoSelect?.();
   authUser = null;
   saveAuthUser();
   state = loadState();
   uploadData = null;
+  isPreparingPhoto = false;
+  photoSelectionId++;
   closeAccountPanel();
   $$(".page").forEach(p=>p.classList.toggle("active", p.id==="calendarPage"));
   $$(".tab").forEach(t=>t.classList.toggle("active", t.dataset.page==="calendarPage"));
@@ -586,6 +819,10 @@ function openAccountPanel(){
     $(".phone").appendChild(panel);
   }
   const logged = isLoggedIn();
+  const localPreviewAllowed = !googleClientId() && isLocalPreviewHost();
+  const loginMessage = googleClientId()
+    ? (googleScriptFailed ? "Google sign-in could not load. Check your connection and reload." : "Continue with your Google account.")
+    : (localPreviewAllowed ? "Google sign-in needs a Client ID. Local preview is available on this device." : "Set GOOGLE_CLIENT_ID in config.js and add this site's origin in Google Cloud Console.");
   panel.innerHTML = `<div class="shade" data-action="close-account"></div>
     <aside class="account-panel">
       <div class="panel-head"><b>Account</b><button data-action="close-account">×</button></div>
@@ -593,7 +830,7 @@ function openAccountPanel(){
           ${profileAvatarHtml("large")}
           <span><b>${authUser.name}</b><small>${authUser.email}</small><small>Tap photo to change icon</small></span>
         </button>
-        <button class="panel-btn" data-action="logout">Log out</button>` : `<div class="login-empty"><div class="auth-mascot small">🍜</div><b>Login required</b><p>Sign in with Google to unlock every feature.</p><div id="panelGoogleButton" class="google-button-slot"></div><button class="panel-btn" data-action="login">Continue with Google</button></div>`}
+        <button class="panel-btn" data-action="logout">Log out</button>` : `<div class="login-empty"><div class="auth-mascot small">🍜</div><b>Login required</b><p>Sign in with Google to unlock every feature.</p><div id="panelGoogleButton" class="google-button-slot"></div>${localPreviewAllowed ? `<button class="panel-btn" data-action="login">Continue with local preview</button>` : ""}<small>${loginMessage}</small></div>`}
     </aside>`;
   attachAuthButtons();
   renderGoogleButton("panelGoogleButton");
@@ -628,6 +865,19 @@ function selectProfileIcon(type, value){
   openAccountPanel();
   toast("Profile icon changed.");
 }
-window.addEventListener("load",()=>{ initGoogleLogin(); renderGoogleButton("gateGoogleButton"); });
+function onGoogleIdentityReady(){
+  initGoogleLogin();
+  renderGoogleButton("gateGoogleButton");
+  renderGoogleButton("panelGoogleButton");
+}
+const googleIdentityScript = $("#googleIdentityScript");
+googleIdentityScript?.addEventListener("load", onGoogleIdentityReady);
+googleIdentityScript?.addEventListener("error",()=>{
+  googleScriptFailed = true;
+  renderGoogleButton("gateGoogleButton");
+  renderGoogleButton("panelGoogleButton");
+});
+window.addEventListener("load", onGoogleIdentityReady);
 
 render();
+if(isLoggedIn()) indexSavedPhotos(state.records);
