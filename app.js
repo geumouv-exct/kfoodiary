@@ -240,38 +240,43 @@ function requestDriveAccessToken(email,prompt=""){
   }
   const oauth = window.google?.accounts?.oauth2;
   if(!oauth || !googleClientId()) return Promise.reject(new Error("Google Drive authorization is unavailable."));
-  driveTokenPending = new Promise((resolve,reject)=>{
-    const finish = (error,token)=>{
-      driveTokenPending = null;
-      driveTokenPendingEmail = "";
-      if(error) reject(error);
-      else resolve(token);
-    };
-    try{
-      driveTokenRequest = oauth.initTokenClient({
-        client_id: googleClientId(),
-        scope: `${DRIVE_SCOPE} openid email profile`,
-        callback: async response=>{
-          if(response?.error || !response?.access_token){ finish(new Error(response?.error_description || response?.error || "Google Drive permission was not granted.")); return; }
-          try{
-            const identity=await fetch("https://openidconnect.googleapis.com/v1/userinfo",{headers:{Authorization:`Bearer ${response.access_token}`}});
-            if(!identity.ok) throw new Error("Could not confirm the Google account for sync.");
-            const profile=await identity.json();
-            if(email && profile.email?.toLowerCase()!==email.toLowerCase()) throw new Error("Choose the same Google account used to sign in.");
-          } catch(error){ finish(error); return; }
-          if(authUser?.email?.toLowerCase()!==email?.toLowerCase()){ finish(new Error("The signed-in account changed before Google Drive connected.")); return; }
-          driveAccessToken = response.access_token;
-          driveAccessTokenExpiresAt = Date.now()+(Number(response.expires_in)||3600)*1000;
-          driveTokenEmail=email?.toLowerCase() || "";
-          finish(null,driveAccessToken);
-        },
-        error_callback: error=>finish(new Error(error?.message || error?.type || "Google Drive authorization failed."))
-      });
-      driveTokenRequest.requestAccessToken({prompt,login_hint:email || ""});
-    } catch(error){ finish(error); }
-  });
+  let resolvePending, rejectPending, settled=false;
+  const pending=new Promise((resolve,reject)=>{ resolvePending=resolve; rejectPending=reject; });
+  driveTokenPending=pending;
   driveTokenPendingEmail=email?.toLowerCase() || "";
-  return driveTokenPending;
+  const finish = (error,token)=>{
+    if(settled) return;
+    settled=true;
+    if(driveTokenPending===pending){
+      driveTokenPending=null;
+      driveTokenPendingEmail="";
+    }
+    if(error) rejectPending(error);
+    else resolvePending(token);
+  };
+  try{
+    driveTokenRequest = oauth.initTokenClient({
+      client_id: googleClientId(),
+      scope: `${DRIVE_SCOPE} openid email profile`,
+      callback: async response=>{
+        if(response?.error || !response?.access_token){ finish(new Error(response?.error_description || response?.error || "Google Drive permission was not granted.")); return; }
+        try{
+          const identity=await fetch("https://openidconnect.googleapis.com/v1/userinfo",{headers:{Authorization:`Bearer ${response.access_token}`}});
+          if(!identity.ok) throw new Error("Could not confirm the Google account for sync.");
+          const profile=await identity.json();
+          if(email && profile.email?.toLowerCase()!==email.toLowerCase()) throw new Error("Choose the same Google account used to sign in.");
+        } catch(error){ finish(error); return; }
+        if(authUser?.email?.toLowerCase()!==email?.toLowerCase()){ finish(new Error("The signed-in account changed before Google Drive connected.")); return; }
+        driveAccessToken = response.access_token;
+        driveAccessTokenExpiresAt = Date.now()+(Number(response.expires_in)||3600)*1000;
+        driveTokenEmail=email?.toLowerCase() || "";
+        finish(null,driveAccessToken);
+      },
+      error_callback: error=>finish(new Error(error?.message || error?.type || "Google Drive authorization failed."))
+    });
+    driveTokenRequest.requestAccessToken({prompt,login_hint:email || ""});
+  } catch(error){ finish(error); }
+  return pending;
 }
 async function driveApi(path,options={}){
   if(!driveTokenIsValid()) throw new Error("Google Drive permission expired. Connect again to sync.");
