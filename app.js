@@ -2,6 +2,10 @@ const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const STORE_KEY = "kfood-dodam-v3";
 const AUTH_KEY = "kfood-dodam-auth";
+const STATE_DB_NAME = "kfood-dodam-account-data";
+const STATE_DB_STORE = "accounts";
+const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.appdata";
+const DRIVE_STATE_FILE = "kfoodiary-account-state.json";
 
 const dishDB = [
   ["Tteokbokki","떡볶이","Sweet and spicy rice cakes","Street Food","Seoul","🌶️"],
@@ -95,6 +99,7 @@ const stampDB = [
 
 let authUser = loadAuthUser();
 let state = loadState();
+let isRestoringAccountState = !!authUser;
 let viewMonth = new Date().getMonth();
 let viewYear = new Date().getFullYear();
 let uploadData = null;
@@ -104,6 +109,19 @@ let googleScriptFailed = false;
 let isSavingRecord = false;
 let isPreparingPhoto = false;
 let photoSelectionId = 0;
+let driveAccessToken = "";
+let driveAccessTokenExpiresAt = 0;
+let driveTokenEmail = "";
+let driveTokenRequest = null;
+let driveTokenPending = null;
+let driveTokenPendingEmail = "";
+let driveStateFileId = "";
+let isCloudSyncReady = false;
+let isCloudSyncing = false;
+let cloudSyncStatus = "";
+let accountSaveQueue = Promise.resolve();
+let initialAccountRestore = Promise.resolve();
+let driveStartupRestoreStarted = false;
 
 function isLocalPreviewHost(){
   return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(window.location.hostname);
@@ -128,16 +146,257 @@ function saveAuthUser(){
   if(authUser) localStorage.setItem(AUTH_KEY, JSON.stringify(authUser));
   else localStorage.removeItem(AUTH_KEY);
 }
-function userStateKey(){
-  return authUser?.email ? `${STORE_KEY}-${authUser.email}` : `${STORE_KEY}-guest`;
+function userStateKey(email = authUser?.email){
+  return email ? `${STORE_KEY}-${String(email).trim().toLowerCase()}` : `${STORE_KEY}-guest`;
 }
 function defaultState(){ return { records: [], profileIcon: null }; }
-function loadState(){
-  if(!authUser) return defaultState();
-  try { return { ...defaultState(), ...(JSON.parse(localStorage.getItem(userStateKey())) || {}) }; }
+function normalizeState(value){
+  return { ...defaultState(), ...(value && typeof value === "object" ? value : {}), records: Array.isArray(value?.records) ? value.records : [] };
+}
+function loadLegacyAccountState(email = authUser?.email){
+  if(!email) return defaultState();
+  try { return normalizeState(JSON.parse(localStorage.getItem(userStateKey(email)))); }
   catch { return defaultState(); }
 }
-function saveState(){ if(authUser) localStorage.setItem(userStateKey(), JSON.stringify(state)); }
+function loadState(){ return authUser ? loadLegacyAccountState() : defaultState(); }
+function openStateDatabase(){
+  if(!window.indexedDB) return Promise.reject(new Error("IndexedDB is unavailable."));
+  return new Promise((resolve,reject)=>{
+    const request = indexedDB.open(STATE_DB_NAME,1);
+    request.onupgradeneeded = ()=>{
+      const db = request.result;
+      if(!db.objectStoreNames.contains(STATE_DB_STORE)) db.createObjectStore(STATE_DB_STORE);
+    };
+    request.onsuccess = ()=>resolve(request.result);
+    request.onerror = ()=>reject(request.error || new Error("Could not open local account storage."));
+  });
+}
+async function readLocalAccountState(email){
+  const key = userStateKey(email);
+  try{
+    const db = await openStateDatabase();
+    const value = await new Promise((resolve,reject)=>{
+      const transaction = db.transaction(STATE_DB_STORE,"readonly");
+      const request = transaction.objectStore(STATE_DB_STORE).get(key);
+      request.onsuccess = ()=>resolve(request.result);
+      request.onerror = ()=>reject(request.error || new Error("Could not read local account storage."));
+      transaction.oncomplete = ()=>db.close();
+      transaction.onerror = ()=>{ db.close(); reject(transaction.error || new Error("Could not read local account storage.")); };
+    });
+    if(value) return normalizeState(value);
+    const legacy = loadLegacyAccountState(email);
+    if(legacy.records.length || legacy.profileIcon){
+      try { await writeLocalAccountState(email,legacy); } catch {}
+    }
+    return legacy;
+  } catch {
+    return loadLegacyAccountState(email);
+  }
+}
+async function writeLocalAccountState(email,snapshot){
+  const key = userStateKey(email);
+  const value = normalizeState(snapshot);
+  const db = await openStateDatabase();
+  await new Promise((resolve,reject)=>{
+    const transaction = db.transaction(STATE_DB_STORE,"readwrite");
+    transaction.objectStore(STATE_DB_STORE).put(value,key);
+    transaction.oncomplete = resolve;
+    transaction.onerror = ()=>reject(transaction.error || new Error("Could not write local account storage."));
+    transaction.onabort = ()=>reject(transaction.error || new Error("Local account storage write was canceled."));
+  }).finally(()=>db.close());
+  try { localStorage.removeItem(key); } catch {}
+}
+async function saveState(){
+  const email = authUser?.email;
+  if(!email) return;
+  state.updatedAt = new Date().toISOString();
+  const snapshot = normalizeState(JSON.parse(JSON.stringify(state)));
+  const save = async ()=>{
+    try { await writeLocalAccountState(email,snapshot); }
+    catch(error){ localStorage.setItem(userStateKey(email),JSON.stringify(snapshot)); }
+    let cloudSynced=false;
+    if(isCloudSyncReady && authUser?.email?.toLowerCase() === email.toLowerCase()){
+      try {
+        await syncAccountStateToDrive(snapshot);
+        cloudSyncStatus = "All activity is synced to your Google account.";
+        cloudSynced=true;
+      } catch(error){
+        isCloudSyncReady = false;
+        cloudSyncStatus = "Saved on this device. Reconnect Google Drive to sync other devices.";
+        console.warn("Could not sync account data to Google Drive.",error);
+      }
+    }
+    return {cloudSynced};
+  };
+  accountSaveQueue = accountSaveQueue.then(save,save);
+  return accountSaveQueue;
+}
+function driveTokenIsValid(){ return !!driveAccessToken && driveAccessTokenExpiresAt > Date.now()+30000 && driveTokenEmail===authUser?.email?.toLowerCase(); }
+function requestDriveAccessToken(email,prompt=""){
+  if(driveTokenIsValid()) return Promise.resolve(driveAccessToken);
+  if(driveTokenPending){
+    if(driveTokenPendingEmail===email?.toLowerCase()) return driveTokenPending;
+    return Promise.reject(new Error("Finish the current Google Drive connection first."));
+  }
+  const oauth = window.google?.accounts?.oauth2;
+  if(!oauth || !googleClientId()) return Promise.reject(new Error("Google Drive authorization is unavailable."));
+  driveTokenPending = new Promise((resolve,reject)=>{
+    const finish = (error,token)=>{
+      driveTokenPending = null;
+      driveTokenPendingEmail = "";
+      if(error) reject(error);
+      else resolve(token);
+    };
+    try{
+      driveTokenRequest = oauth.initTokenClient({
+        client_id: googleClientId(),
+        scope: `${DRIVE_SCOPE} openid email profile`,
+        callback: async response=>{
+          if(response?.error || !response?.access_token){ finish(new Error(response?.error_description || response?.error || "Google Drive permission was not granted.")); return; }
+          try{
+            const identity=await fetch("https://openidconnect.googleapis.com/v1/userinfo",{headers:{Authorization:`Bearer ${response.access_token}`}});
+            if(!identity.ok) throw new Error("Could not confirm the Google account for sync.");
+            const profile=await identity.json();
+            if(email && profile.email?.toLowerCase()!==email.toLowerCase()) throw new Error("Choose the same Google account used to sign in.");
+          } catch(error){ finish(error); return; }
+          if(authUser?.email?.toLowerCase()!==email?.toLowerCase()){ finish(new Error("The signed-in account changed before Google Drive connected.")); return; }
+          driveAccessToken = response.access_token;
+          driveAccessTokenExpiresAt = Date.now()+(Number(response.expires_in)||3600)*1000;
+          driveTokenEmail=email?.toLowerCase() || "";
+          finish(null,driveAccessToken);
+        },
+        error_callback: error=>finish(new Error(error?.message || error?.type || "Google Drive authorization failed."))
+      });
+      driveTokenRequest.requestAccessToken({prompt,login_hint:email || ""});
+    } catch(error){ finish(error); }
+  });
+  driveTokenPendingEmail=email?.toLowerCase() || "";
+  return driveTokenPending;
+}
+async function driveApi(path,options={}){
+  if(!driveTokenIsValid()) throw new Error("Google Drive permission expired. Connect again to sync.");
+  const response=await fetch(`https://www.googleapis.com/drive/v3/${path}`,{
+    ...options,
+    headers:{Authorization:`Bearer ${driveAccessToken}`,...options.headers}
+  });
+  if(!response.ok){
+    const detail=await response.text().catch(()=>"");
+    throw new Error(`Google Drive request failed (${response.status}). ${detail.slice(0,240)}`);
+  }
+  return response;
+}
+async function findDriveStateFile(){
+  const query=new URLSearchParams({spaces:"appDataFolder",pageSize:"100",fields:"files(id,name,modifiedTime)",q:`name='${DRIVE_STATE_FILE}'`});
+  const result=await (await driveApi(`files?${query}`)).json();
+  const file=result.files?.find(item=>item.name===DRIVE_STATE_FILE);
+  driveStateFileId=file?.id || "";
+  return file || null;
+}
+async function readDriveAccountState(){
+  const file=await findDriveStateFile();
+  if(!file) return defaultState();
+  const response=await driveApi(`files/${encodeURIComponent(file.id)}?alt=media`);
+  const payload=await response.json();
+  return normalizeState(payload?.state || payload);
+}
+async function uploadDriveStateFile(snapshot){
+  const payload=JSON.stringify({version:1,updatedAt:new Date().toISOString(),state:normalizeState(snapshot)});
+  let sessionUrl;
+  if(driveStateFileId){
+    const response=await fetch(`https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(driveStateFileId)}?uploadType=resumable`,{
+      method:"PATCH",
+      headers:{Authorization:`Bearer ${driveAccessToken}`,"Content-Type":"application/json; charset=UTF-8","X-Upload-Content-Type":"application/json","X-Upload-Content-Length":String(new TextEncoder().encode(payload).length)},
+      body:JSON.stringify({mimeType:"application/json"})
+    });
+    if(!response.ok) throw new Error(`Google Drive upload setup failed (${response.status}).`);
+    sessionUrl=response.headers.get("Location");
+  } else {
+    const response=await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&fields=id",{
+      method:"POST",
+      headers:{Authorization:`Bearer ${driveAccessToken}`,"Content-Type":"application/json; charset=UTF-8","X-Upload-Content-Type":"application/json","X-Upload-Content-Length":String(new TextEncoder().encode(payload).length)},
+      body:JSON.stringify({name:DRIVE_STATE_FILE,mimeType:"application/json",parents:["appDataFolder"]})
+    });
+    if(!response.ok) throw new Error(`Google Drive file setup failed (${response.status}).`);
+    sessionUrl=response.headers.get("Location");
+  }
+  if(!sessionUrl) throw new Error("Google Drive did not return an upload session.");
+  const upload=await fetch(sessionUrl,{method:"PUT",headers:{"Content-Type":"application/json"},body:payload});
+  if(!upload.ok) throw new Error(`Google Drive upload failed (${upload.status}).`);
+  const result=await upload.json().catch(()=>({}));
+  if(result.id) driveStateFileId=result.id;
+}
+async function syncAccountStateToDrive(snapshot){
+  if(isCloudSyncing) return;
+  if(!driveTokenIsValid()) throw new Error("Google Drive permission expired.");
+  isCloudSyncing=true;
+  try{
+    if(!driveStateFileId) await findDriveStateFile();
+    await uploadDriveStateFile(snapshot);
+  } finally { isCloudSyncing=false; }
+}
+function mergeAccountStates(cloudValue,localValue){
+  const cloud=normalizeState(cloudValue), local=normalizeState(localValue);
+  const recordsById=new Map();
+  for(const record of [...cloud.records,...local.records]){
+    const current=recordsById.get(record.id);
+    const currentTime=Date.parse(current?.updatedAt || current?.createdAt || current?.date || 0) || 0;
+    const nextTime=Date.parse(record.updatedAt || record.createdAt || record.date || 0) || 0;
+    if(!current || nextTime>=currentTime) recordsById.set(record.id,record);
+  }
+  const records=[...recordsById.values()].sort((a,b)=>(Date.parse(a.date)||0)-(Date.parse(b.date)||0));
+  const cloudTime=Date.parse(cloud.updatedAt || 0) || 0, localTime=Date.parse(local.updatedAt || 0) || 0;
+  const localHasData=local.records.length>0 || !!local.profileIcon;
+  const preferLocal=localTime>cloudTime || (!cloudTime && localHasData);
+  const latestTime=Math.max(cloudTime,localTime);
+  return {records,profileIcon:preferLocal?local.profileIcon:cloud.profileIcon,updatedAt:latestTime?new Date(latestTime).toISOString():null};
+}
+async function restoreAccountState(email,tokenPromise=null){
+  const account=email?.trim().toLowerCase();
+  if(!account) return;
+  isRestoringAccountState=true;
+  try{
+    const local=await readLocalAccountState(account);
+    if(authUser?.email?.toLowerCase()!==account) return;
+    state=local;
+    render();
+    if(tokenPromise){
+      try{
+        await tokenPromise;
+        const cloud=await readDriveAccountState();
+        if(authUser?.email?.toLowerCase()!==account) return;
+        state=mergeAccountStates(cloud,local);
+        isCloudSyncReady=true;
+        cloudSyncStatus="Google Drive sync is connected.";
+        await writeLocalAccountState(account,state);
+        await syncAccountStateToDrive(state);
+        cloudSyncStatus="All activity is synced to your Google account.";
+      } catch(error){
+        isCloudSyncReady=false;
+        cloudSyncStatus=/403|accessNotConfigured|Drive API/i.test(String(error?.message))
+          ? "Enable Google Drive API and add drive.appdata to OAuth Data Access, then reconnect."
+          : "Google Drive sync needs permission. Your device copy is kept.";
+        console.warn("Could not restore cloud account data.",error);
+      }
+    } else {
+      isCloudSyncReady=false;
+      cloudSyncStatus="Connect Google Drive to restore and sync activity on other devices.";
+    }
+  } finally {
+    if(authUser?.email?.toLowerCase()===account){
+      await indexSavedPhotos(state.records);
+      isRestoringAccountState=false;
+      render();
+    }
+  }
+}
+function connectGoogleDriveSync(){
+  if(!authUser?.email) return;
+  const email=authUser.email;
+  const tokenPromise=requestDriveAccessToken(email);
+  closeAccountPanel();
+  toast("Connecting Google Drive sync…");
+  restoreAccountState(email,tokenPromise);
+}
 function isLoggedIn(){ return !!authUser; }
 function toast(msg){
   let el = $(".toast");
@@ -145,6 +404,7 @@ function toast(msg){
   el.textContent = msg; el.classList.add("show"); setTimeout(()=>el.classList.remove("show"), 1900);
 }
 function showPage(pageId){
+  if(isRestoringAccountState){ toast("Restoring your account data…"); return; }
   if(!isLoggedIn()){
     openAccountPanel();
     toast("Please sign in with Google first.");
@@ -162,6 +422,18 @@ function ymd(date){
   if(!Number.isFinite(value.getTime())) return "";
   return `${value.getFullYear()}-${String(value.getMonth()+1).padStart(2,"0")}-${String(value.getDate()).padStart(2,"0")}`;
 }
+function localDateTimeValue(date = new Date()){
+  const pad = value => String(value).padStart(2,"0");
+  return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+function parseLocalDateTime(value){
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(value);
+  if(!match) return new Date(NaN);
+  const [year, month, day, hour, minute] = match.slice(1).map(Number);
+  const date = new Date(year, month-1, day, hour, minute);
+  if(date.getFullYear() !== year || date.getMonth() !== month-1 || date.getDate() !== day || date.getHours() !== hour || date.getMinutes() !== minute) return new Date(NaN);
+  return date;
+}
 function monthName(y,m){ return new Date(y,m,1).toLocaleString('en',{month:'long', year:'numeric'}); }
 function recordsThisMonth(){ return uniquePhotoRecords().filter(r=>{ const d=new Date(r.date); return d.getFullYear()===viewYear && d.getMonth()===viewMonth; }); }
 function unique(arr){ return [...new Set(arr.filter(Boolean))]; }
@@ -172,18 +444,27 @@ function matchDish(record){
 function unlockedDishIds(){ return new Set(uniquePhotoRecords().map(matchDish).filter(Boolean).map(d=>d.id)); }
 function uniquePhotoRecords(records = state.records){
   const accepted = [];
-  const seenHashes = [];
   records.forEach(record=>{
     const hash = record.photoHash;
-    if(hash && seenHashes.includes(hash)) return;
+    if(hash && accepted.some(saved=>areSamePhoto(saved.photoHash,hash))) return;
     accepted.push(record);
-    if(hash) seenHashes.push(hash);
   });
   return accepted;
 }
-function areSamePhoto(a, b){ return !!a && !!b && a === b; }
-function photoHashPrefix(){ return window.crypto?.subtle ? "sha256:" : "local:"; }
-function isCurrentPhotoHash(hash){ return typeof hash === "string" && hash.startsWith(photoHashPrefix()); }
+function photoPerceptualPart(hash){
+  const match = typeof hash === "string" ? hash.match(/^visual-v1:[a-f0-9]+:([a-f0-9]{16})$/i) : null;
+  return match?.[1]?.toLowerCase() || "";
+}
+function areSamePhoto(a, b){
+  if(!a || !b) return false;
+  if(a === b) return true;
+  const hashA = photoPerceptualPart(a), hashB = photoPerceptualPart(b);
+  if(!hashA || !hashB) return false;
+  let bits = BigInt(`0x${hashA}`) ^ BigInt(`0x${hashB}`), distance = 0;
+  while(bits){ distance++; bits &= bits-1n; }
+  return distance <= 2;
+}
+function isCurrentPhotoHash(hash){ return typeof hash === "string" && hash.startsWith("visual-v1:"); }
 function favoriteDishIds(){
   const ids = new Set();
   uniquePhotoRecords().filter(r=>r.favorite).forEach(r=>{ const d=matchDish(r); if(d) ids.add(d.id); });
@@ -261,6 +542,79 @@ function renderCalendar(){
   });
 }
 
+// GitHub Pages serves source files directly, so keep a no-build gallery available when the React
+// bridge hasn't been bundled. Vite's compiled bridge replaces this implementation when present.
+if(!window.mountDayPhotoStack){
+  window.mountDayPhotoStack=(container,records,onChange)=>{
+    let index=0, pointerStart=null, wasSwipe=false;
+    const frame=document.createElement("div");
+    frame.className="day-photo-fallback";
+    const card=document.createElement("article");
+    card.className="day-photo-card";
+    const image=document.createElement("img");
+    image.alt="Original food photo";
+    image.draggable=false;
+    const placeholder=document.createElement("div");
+    placeholder.className="day-photo-placeholder";
+    placeholder.textContent="No photo saved for this entry";
+    const details=document.createElement("div");
+    details.className="day-photo-details";
+    const name=document.createElement("b");
+    const description=document.createElement("small");
+    details.append(name,description);
+    card.append(image,placeholder,details);
+    const controls=document.createElement("div");
+    controls.className="day-photo-fallback-controls";
+    const previous=document.createElement("button");
+    previous.type="button"; previous.className="day-photo-step"; previous.textContent="‹"; previous.setAttribute("aria-label","Previous photo");
+    const counter=document.createElement("small");
+    counter.setAttribute("aria-live","polite");
+    const next=document.createElement("button");
+    next.type="button"; next.className="day-photo-step"; next.textContent="›"; next.setAttribute("aria-label","Next photo");
+    controls.append(previous,counter,next);
+    frame.append(card,controls);
+    container.replaceChildren(frame);
+    const show=nextIndex=>{
+      index=(nextIndex+records.length)%records.length;
+      const record=records[index];
+      image.hidden=!record.original;
+      placeholder.hidden=!!record.original;
+      if(record.original) image.src=record.original;
+      name.textContent=record.dishName || "Food photo";
+      const recordDate=new Date(record.date);
+      const time=Number.isFinite(recordDate.getTime())?recordDate.toLocaleTimeString(undefined,{hour:"numeric",minute:"2-digit"}):"";
+      description.textContent=[record.dishKr,record.restaurant || "Unknown restaurant",time].filter(Boolean).join(" · ");
+      counter.textContent=`${index+1} of ${records.length} photos`;
+      const single=records.length<2;
+      previous.hidden=next.hidden=single;
+      controls.hidden=single;
+      onChange?.(index);
+    };
+    const showPrevious=()=>show(index-1), showNext=()=>show(index+1);
+    previous.addEventListener("click",showPrevious);
+    next.addEventListener("click",showNext);
+    card.addEventListener("pointerdown",event=>{ pointerStart=event.clientX; });
+    card.addEventListener("pointerup",event=>{
+      if(pointerStart===null) return;
+      const delta=event.clientX-pointerStart;
+      pointerStart=null;
+      wasSwipe=Math.abs(delta)>35;
+      if(wasSwipe) show(delta<0?index+1:index-1);
+    });
+    card.addEventListener("pointercancel",()=>{pointerStart=null;});
+    card.addEventListener("click",event=>{
+      if(event.target===image && records.length>1 && !wasSwipe) showNext();
+      wasSwipe=false;
+    });
+    show(0);
+    return ()=>{
+      previous.removeEventListener("click",showPrevious);
+      next.removeEventListener("click",showNext);
+      container.replaceChildren();
+    };
+  };
+}
+
 function openDayGallery(dayKey){
   const records = uniquePhotoRecords().filter(record=>ymd(record.date)===dayKey);
   if(!records.length) return;
@@ -303,7 +657,7 @@ function openDayGallery(dayKey){
 
 function renderAdd(){
   const page = $("#addPage");
-  const now = new Date(); now.setMinutes(now.getMinutes()-now.getTimezoneOffset());
+  const dateTimeValue = localDateTimeValue();
   page.innerHTML = `<div class="scroll">
     <div class="header"><button class="round menu-btn" type="button" aria-label="Open account menu">☰</button><div class="title"><h1>Add K-Food</h1><p>We turn your food photo into a sticker</p></div><button id="quickSave" class="round">✓</button></div>
     <div class="card upload-card">
@@ -316,7 +670,7 @@ function renderAdd(){
       <button class="upload-btn" id="uploadBtn">📷 Add photo</button>
     </div>
     <div class="card form-card">
-      <div class="row"><span class="ico">📅</span><label>Date</label><input id="dateInput" type="datetime-local" value="${now.toISOString().slice(0,16)}"><span>›</span></div>
+      <div class="row date-row"><span class="ico">📅</span><div class="date-control"><label for="dateInput">Date &amp; time</label><input id="dateInput" type="datetime-local" step="60" value="${dateTimeValue}" aria-label="Date and time"></div></div>
       <small class="daily-photo-limit">Save up to 3 photos per date.</small>
       <div class="row"><span class="ico">📍</span><label>Restaurant</label><input id="restaurantInput" placeholder="Search with Google Maps"><span>›</span></div>
       <div class="map-actions"><button id="mapsBtn" class="mini-btn">Open Google Maps</button><small class="map-help">Paste a Google Maps place URL here to auto-fill the name.</small></div>
@@ -454,23 +808,56 @@ function fileToDataURL(file){
   });
 }
 function loadImg(src){ return new Promise((res,rej)=>{ const img=new Image(); img.onload=()=>res(img); img.onerror=rej; img.src=src; }); }
-// Hash the uploaded file bytes so an exact re-upload is rejected without matching different photos of the same dish.
+// Hash normalized image pixels and a perceptual signature. This catches byte-identical images and
+// visually identical re-encodes while remaining specific enough to allow another photo of the same dish.
 async function makePhotoHash(src){
-  const payload = String(src).split(",",2)[1] || String(src);
+  const image = await loadImg(src);
+  const canonicalCanvas=document.createElement("canvas");
+  canonicalCanvas.width=128; canonicalCanvas.height=128;
+  const canonicalContext=canonicalCanvas.getContext("2d",{willReadFrequently:true});
+  if(!canonicalContext) throw new Error("Could not normalize the image.");
+  canonicalContext.fillStyle="#fff"; canonicalContext.fillRect(0,0,128,128);
+  const canonicalScale=Math.min(128/image.naturalWidth,128/image.naturalHeight);
+  const canonicalWidth=image.naturalWidth*canonicalScale, canonicalHeight=image.naturalHeight*canonicalScale;
+  canonicalContext.drawImage(image,(128-canonicalWidth)/2,(128-canonicalHeight)/2,canonicalWidth,canonicalHeight);
+  const canonicalPixels=canonicalContext.getImageData(0,0,128,128).data;
+  const size = 32;
+  const canvas = document.createElement("canvas");
+  canvas.width = size; canvas.height = size;
+  const ctx = canvas.getContext("2d",{willReadFrequently:true});
+  if(!ctx) throw new Error("Could not read the image pixels.");
+  ctx.fillStyle = "#fff"; ctx.fillRect(0,0,size,size);
+  const scale = Math.min(size/image.naturalWidth,size/image.naturalHeight);
+  const width = image.naturalWidth*scale, height = image.naturalHeight*scale;
+  ctx.drawImage(image,(size-width)/2,(size-height)/2,width,height);
+  const pixels = ctx.getImageData(0,0,size,size).data;
+  const gray = new Float64Array(size*size);
+  for(let i=0;i<gray.length;i++){
+    const offset=i*4;
+    gray[i]=0.299*pixels[offset]+0.587*pixels[offset+1]+0.114*pixels[offset+2];
+  }
+  const cos = Array.from({length:8},(_,frequency)=>Array.from({length:size},(_,position)=>Math.cos(((2*position+1)*frequency*Math.PI)/(2*size))));
+  const coefficients=[];
+  for(let v=0;v<8;v++) for(let u=0;u<8;u++){
+    if(u===0 && v===0) continue;
+    let sum=0;
+    for(let y=0;y<size;y++) for(let x=0;x<size;x++) sum+=gray[y*size+x]*cos[u][x]*cos[v][y];
+    coefficients.push(sum);
+  }
+  const sorted=[...coefficients].sort((a,b)=>a-b);
+  const median=sorted[Math.floor(sorted.length/2)];
+  let signature=0n;
+  coefficients.forEach((value,index)=>{ if(value>=median) signature |= 1n<<BigInt(index); });
+  let pixelDigest="";
   if(window.crypto?.subtle){
-    const digest = await window.crypto.subtle.digest("SHA-256",new TextEncoder().encode(payload));
-    const hex = [...new Uint8Array(digest)].map(byte=>byte.toString(16).padStart(2,"0")).join("");
-    return `sha256:${hex}`;
+    const digest=await window.crypto.subtle.digest("SHA-256",canonicalPixels.buffer);
+    pixelDigest=[...new Uint8Array(digest)].map(byte=>byte.toString(16).padStart(2,"0")).join("");
+  } else {
+    let a=0x811c9dc5;
+    for(const byte of canonicalPixels) a=Math.imul(a^byte,0x01000193);
+    pixelDigest=(a>>>0).toString(16).padStart(8,"0");
   }
-  let a=0x811c9dc5, b=0x9e3779b9, c=0x85ebca6b, d=0xc2b2ae35;
-  for(let i=0; i<payload.length; i++){
-    const code = payload.charCodeAt(i);
-    a = Math.imul(a ^ code,0x01000193);
-    b = Math.imul(b ^ (code+i),0x5bd1e995); b ^= b >>> 13;
-    c = Math.imul(c ^ (code+(i<<8)),0x27d4eb2d); c ^= c >>> 15;
-    d = Math.imul(d ^ (code^i),0x165667b1); d ^= d >>> 16;
-  }
-  return `local:${[a,b,c,d].map(value=>(value>>>0).toString(16).padStart(8,"0")).join("")}`;
+  return `visual-v1:${pixelDigest}:${signature.toString(16).padStart(16,"0")}`;
 }
 async function indexSavedPhotos(records = state.records){
   const sourceState = state;
@@ -485,8 +872,16 @@ async function indexSavedPhotos(records = state.records){
       console.warn("Could not index a saved food photo.", error);
     }
   }
+  const deduplicated = [];
+  for(const record of records){
+    const duplicate = record.photoHash && deduplicated.some(saved=>areSamePhoto(saved.photoHash,record.photoHash));
+    if(duplicate) changed = true;
+    else deduplicated.push(record);
+  }
   if(changed && state === sourceState && authUser?.email === email){
-    saveState();
+    state.records = deduplicated;
+    try { await saveState(); }
+    catch(error){ console.warn("Could not save updated photo indexes.",error); }
     if(!$("#addPage")?.classList.contains("active")) render();
   }
 }
@@ -527,15 +922,17 @@ function paintPreview(original, sticker){
 }
 async function saveAddForm(){
   if(!isLoggedIn()){ openAccountPanel(); toast("Please sign in with Google first."); return; }
+  if(isRestoringAccountState){ toast("Restoring your account data…"); return; }
   if(isSavingRecord) return;
   const dishRaw = $("#dishInput")?.value.trim();
   if(!dishRaw){ toast("Please enter a dish name."); return; }
   if(isPreparingPhoto){ toast("Photo is still processing. Please wait a moment."); return; }
   if(!uploadData?.sticker){ toast("Please add a photo first."); return; }
   const dateValue = $("#dateInput")?.value || "";
-  const recordDate = dateValue ? new Date(dateValue) : new Date();
+  const recordDate = dateValue ? parseLocalDateTime(dateValue) : new Date();
   if(!Number.isFinite(recordDate.getTime())){ toast("Please choose a valid date."); return; }
   const recordDay = ymd(recordDate);
+  await indexSavedPhotos(state.records);
   const recordsForDay = uniquePhotoRecords().filter(record=>ymd(record.date)===recordDay).length;
   if(recordsForDay >= 3){ toast("You can save up to 3 photos per date."); return; }
   const form = {
@@ -549,6 +946,8 @@ async function saveAddForm(){
   const saveButtons = [$("#quickSave"), $("#saveBtn")].filter(Boolean);
   isSavingRecord = true;
   saveButtons.forEach(button=>button.disabled=true);
+  let saved = false;
+  let rec;
   try{
     const photoHash = photo.photoHash || await makePhotoHash(photo.original);
     let photoAlreadyUsed = false;
@@ -556,13 +955,12 @@ async function saveAddForm(){
       const priorHash = await getRecordPhotoHash(record);
       if(areSamePhoto(photoHash, priorHash)) photoAlreadyUsed = true;
     }
-    saveState();
     if(photoAlreadyUsed){
       toast("This photo was already added. Choose a different photo.");
       return;
     }
     const [name, kr=""] = dishRaw.split("/").map(s=>s.trim());
-    const rec = {
+    rec = {
       id: crypto.randomUUID ? crypto.randomUUID() : `rec-${Date.now()}`,
       date: recordDate.toISOString(),
       restaurant: form.restaurant,
@@ -575,22 +973,38 @@ async function saveAddForm(){
       original: photo.original,
       sticker: photo.sticker,
       photoHash,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
     };
     state.records.push(rec);
-    saveState();
-    if(uploadData === photo) uploadData = null;
-    const d = new Date(rec.date); viewYear=d.getFullYear(); viewMonth=d.getMonth();
-    renderAdd();
-    showPage("calendarPage");
-    toast("Completed!");
+    try{
+      await saveState();
+      saved = true;
+    } catch(error){
+      state.records = state.records.filter(record=>record.id !== rec.id);
+      throw error;
+    }
   } catch(error){
     console.error("Could not save the food record.", error);
     toast("Could not save this entry. Please try again.");
+    return;
   } finally {
     isSavingRecord = false;
     saveButtons.forEach(button=>{ if(button.isConnected) button.disabled=false; });
   }
+  if(!saved) return;
+  if(uploadData === photo) uploadData = null;
+  const d = new Date(rec.date); viewYear=d.getFullYear(); viewMonth=d.getMonth();
+  try{
+    renderAdd();
+    showPage("calendarPage");
+  } catch(error){
+    console.error("The food record was saved, but the screen could not refresh.", error);
+    $$(".page").forEach(page=>page.classList.toggle("active", page.id === "calendarPage"));
+    $$(".tab").forEach(button=>button.classList.toggle("active", button.dataset.page === "calendarPage"));
+    try{ renderCalendar(); attachHeaderMenu(); renderAuthGate(); } catch(refreshError){ console.error("Could not refresh the saved calendar.", refreshError); }
+  }
+  toast("Completed!");
 }
 
 function renderBook(){
@@ -628,12 +1042,14 @@ function dishCard(d, isUnlocked, isFav){
     ${isUnlocked?`<div class="badges"><span class="badge">${d.category}</span><span class="badge">${d.city}</span></div>`:`<div class="locked-overlay"><span>🔒 Locked</span></div>`}
   </article>`;
 }
-function toggleBookFavorite(dishId){
+async function toggleBookFavorite(dishId){
   const records = uniquePhotoRecords().filter(r=>matchDish(r)?.id===dishId);
   if(!records.length) return;
   const shouldFav = !records.some(r=>r.favorite);
-  records.forEach(r=>r.favorite = shouldFav);
-  saveState(); renderBook(); toast(shouldFav?"Added to Favorites":"Removed from Favorites");
+  const before=records.map(record=>record.favorite);
+  records.forEach(r=>{r.favorite = shouldFav; r.updatedAt=new Date().toISOString();});
+  try { await saveState(); renderBook(); toast(shouldFav?"Added to Favorites":"Removed from Favorites"); }
+  catch(error){ records.forEach((record,index)=>record.favorite=before[index]); toast("Could not save this change. Please try again."); }
 }
 
 function renderStamps(){
@@ -662,6 +1078,7 @@ function attachHeaderMenu(){
 function attachAuthButtons(){
   $$("[data-action='login']").forEach(btn=>btn.onclick=startGoogleLogin);
   $$("[data-action='logout']").forEach(btn=>btn.onclick=logout);
+  $$("[data-action='connect-drive-sync']").forEach(btn=>btn.onclick=connectGoogleDriveSync);
   $$("[data-action='close-account']").forEach(btn=>btn.onclick=closeAccountPanel);
   $$("[data-action='account']").forEach(btn=>btn.onclick=openAccountPanel);
   $$("[data-action='open-icon-picker']").forEach(btn=>btn.onclick=openIconPicker);
@@ -710,11 +1127,11 @@ function startGoogleLogin(){
     loginProvider: "local-preview"
   };
   saveAuthUser();
-  state = loadState();
+  state = defaultState();
   closeAccountPanel();
   toast("Local preview login enabled.");
   render();
-  indexSavedPhotos(state.records);
+  restoreAccountState(authUser.email);
 }
 function initGoogleLogin(){
   const clientId = googleClientId();
@@ -774,16 +1191,32 @@ function handleGoogleCredential(response){
     expiresAt,
     loginProvider: "google"
   };
+  driveAccessToken="";
+  driveAccessTokenExpiresAt=0;
+  driveTokenEmail="";
+  driveStateFileId="";
+  isCloudSyncReady=false;
+  cloudSyncStatus="";
+  const accountEmail=authUser.email;
+  const driveTokenPromise=requestDriveAccessToken(accountEmail);
   saveAuthUser();
-  state = loadState();
+  state = defaultState();
+  isRestoringAccountState=true;
   closeAccountPanel();
   toast(`Welcome, ${authUser.name}!`);
   render();
-  indexSavedPhotos(state.records);
+  restoreAccountState(accountEmail,driveTokenPromise);
 }
 function logout(){
   window.google?.accounts?.id?.disableAutoSelect?.();
   authUser = null;
+  driveAccessToken="";
+  driveAccessTokenExpiresAt=0;
+  driveTokenEmail="";
+  driveStateFileId="";
+  isCloudSyncReady=false;
+  cloudSyncStatus="";
+  isRestoringAccountState=false;
   saveAuthUser();
   state = loadState();
   uploadData = null;
@@ -830,6 +1263,7 @@ function openAccountPanel(){
           ${profileAvatarHtml("large")}
           <span><b>${authUser.name}</b><small>${authUser.email}</small><small>Tap photo to change icon</small></span>
         </button>
+        <div class="cloud-sync-card"><small>${cloudSyncStatus || "Connect Google Drive to restore and sync activity on other devices."}</small><button class="panel-btn" data-action="connect-drive-sync" ${isRestoringAccountState?"disabled":""}>${isCloudSyncReady?"Sync now":"Connect Google Drive sync"}</button></div>
         <button class="panel-btn" data-action="logout">Log out</button>` : `<div class="login-empty"><div class="auth-mascot small">🍜</div><b>Login required</b><p>Sign in with Google to unlock every feature.</p><div id="panelGoogleButton" class="google-button-slot"></div>${localPreviewAllowed ? `<button class="panel-btn" data-action="login">Continue with local preview</button>` : ""}<small>${loginMessage}</small></div>`}
     </aside>`;
   attachAuthButtons();
@@ -857,10 +1291,12 @@ function openIconPicker(){
     </section>`;
   attachAuthButtons();
 }
-function selectProfileIcon(type, value){
+async function selectProfileIcon(type, value){
+  const previous=state.profileIcon;
   if(type === "google") state.profileIcon = null;
   else state.profileIcon = { type, value };
-  saveState();
+  try { await saveState(); }
+  catch(error){ state.profileIcon=previous; toast("Could not save this change. Please try again."); return; }
   $("#iconPicker")?.remove();
   openAccountPanel();
   toast("Profile icon changed.");
@@ -869,6 +1305,14 @@ function onGoogleIdentityReady(){
   initGoogleLogin();
   renderGoogleButton("gateGoogleButton");
   renderGoogleButton("panelGoogleButton");
+  if(isLoggedIn() && !driveStartupRestoreStarted){
+    driveStartupRestoreStarted=true;
+    const email=authUser.email;
+    initialAccountRestore.then(()=>{
+      if(authUser?.email?.toLowerCase()!==email.toLowerCase()) return;
+      restoreAccountState(email,requestDriveAccessToken(email,"none"));
+    });
+  }
 }
 const googleIdentityScript = $("#googleIdentityScript");
 googleIdentityScript?.addEventListener("load", onGoogleIdentityReady);
@@ -880,4 +1324,4 @@ googleIdentityScript?.addEventListener("error",()=>{
 window.addEventListener("load", onGoogleIdentityReady);
 
 render();
-if(isLoggedIn()) indexSavedPhotos(state.records);
+if(isLoggedIn()) initialAccountRestore=restoreAccountState(authUser.email);
