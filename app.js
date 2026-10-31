@@ -569,7 +569,9 @@ if(!window.mountDayPhotoStack){
     details.className="day-photo-details";
     const name=document.createElement("b");
     const description=document.createElement("small");
-    details.append(name,description);
+    const notes=document.createElement("small");
+    notes.className="day-photo-notes";
+    details.append(name,description,notes);
     card.append(image,placeholder,details);
     const controls=document.createElement("div");
     controls.className="day-photo-fallback-controls";
@@ -592,6 +594,9 @@ if(!window.mountDayPhotoStack){
       const recordDate=new Date(record.date);
       const time=Number.isFinite(recordDate.getTime())?recordDate.toLocaleTimeString(undefined,{hour:"numeric",minute:"2-digit"}):"";
       description.textContent=[record.dishKr,record.restaurant || "Unknown restaurant",time].filter(Boolean).join(" · ");
+      const noteText=typeof record.notes==="string"?record.notes.trim():"";
+      notes.textContent=noteText?`Notes: ${noteText}`:"";
+      notes.hidden=!noteText;
       counter.textContent=`${index+1} of ${records.length} photos`;
       const single=records.length<2;
       previous.hidden=next.hidden=single;

@@ -10,6 +10,7 @@ function DayPhotoCard({ record, index, count }) {
   const details = [record.dishKr, record.restaurant || 'Unknown restaurant', time]
     .filter(Boolean)
     .join(' · ');
+  const notes = typeof record.notes === 'string' ? record.notes.trim() : '';
 
   return (
     <article className="day-photo-card" role="group" aria-label={`Photo ${index + 1} of ${count}`}>
@@ -26,6 +27,7 @@ function DayPhotoCard({ record, index, count }) {
       <div className="day-photo-details">
         <b>{record.dishName || 'Food photo'}</b>
         <small>{details}</small>
+        {notes ? <small className="day-photo-notes">Notes: {notes}</small> : null}
       </div>
     </article>
   );
